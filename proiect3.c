@@ -40,8 +40,8 @@ void getEntryMetadata(const char *path,EntryMetadata *metadata) {
     metadata->modified_time = fileStat.st_mtime;
 }
 
-// Funcție pentru verificarea drepturilor lipsă ale unui fișier și analiza sintactică
-void checkPermissionsAndAnalyze(char filepath, const char *isolated_dir, int isSafe, int* countUSF) {
+/*// Funcție pentru verificarea drepturilor lipsă ale unui fișier și analiza sintactică
+void checkPermissionsAndAnalyze(char *filepath, const char *isolated_dir, int* isSafe, int* countUSF) {
     // Verificăm drepturile de acces ale fișierului
     if (access(filepath, R_OK) == -1 || access(filepath, W_OK) == -1 || access(filepath, X_OK) == -1) {
         // Dacă fișierul are drepturi lipsă, creăm un proces dedicat pentru analiza sintactica
@@ -91,11 +91,89 @@ void checkPermissionsAndAnalyze(char filepath, const char *isolated_dir, int isS
             }
         }
     }
+}*/
+
+void checkPermissionsAndAnalyze(char *filepath, const char *isolated_dir, int *isSafe, int* countUSF, int *countFisCuPotential) {
+    int pipefd[2];
+
+    // Creăm pipe-ul
+    if (pipe(pipefd) == -1) {
+        perror("pipe");
+        exit(EXIT_FAILURE);
+    }
+
+    // Verificăm drepturile de acces ale fișierului
+    if (access(filepath, R_OK) == -1 || access(filepath, W_OK) == -1 || access(filepath, X_OK) == -1) {
+        // Dacă fișierul are drepturi lipsă, creăm un proces dedicat pentru analiza sintactică
+        (*isSafe) = 0;
+        (*countUSF)++;
+        pid_t pid = fork();
+        if (pid < 0) { // Eroare la fork()
+            perror("fork");
+            exit(EXIT_FAILURE);
+        }
+        if (pid == 0) { // Proces copil
+            // Redirecționăm ieșirea standard către pipe pentru a putea citi din script
+             //printf("incepe\n");
+            close(pipefd[0]); // Închidem capătul nepotrivit al pipe-ului
+            if (dup2(pipefd[1], STDOUT_FILENO) == -1) { // Redirecționăm stdout către capătul de scriere al pipe-ului
+                perror("dup2");
+                exit(EXIT_FAILURE);
+            }
+            close(pipefd[1]); // Închidem capătul de scriere al pipe-ului după duplicare
+            // Executăm scriptul de analiză sintactică
+            execlp("./verify_for_malicious.sh", "verify_for_malicious.sh", filepath, NULL);
+            // Dacă execuția nu reușește, afișăm un mesaj de eroare
+            perror("execl");
+            exit(EXIT_FAILURE);
+        }
+        else { // Proces părinte
+            close(pipefd[1]); // Închidem capătul de scriere al pipe-ului în procesul părinte
+            // Așteptăm să citim din pipe
+            char buffer[1024];
+            ssize_t nbytes;
+            while ((nbytes = read(pipefd[0], buffer, sizeof(buffer))) > 0) {
+                // Procesăm datele citite din pipe, dacă este necesar
+            }
+            close(pipefd[0]); // Închidem capătul de citire al pipe-ului
+            // Așteptăm terminarea procesului copil
+            int status;
+            waitpid(pid, &status, 0);
+            // Verificăm dacă procesul copil s-a încheiat cu succes sau nu
+            if (WIFEXITED(status)) {
+                // Dacă fișierul este considerat periculos, îl izolăm în directorul special
+                if (WEXITSTATUS(status) == 1) {
+                    char *filename = strrchr(filepath, '/');
+                    if (filename == NULL) {
+                        filename = filepath; // No directory in path, just the filename
+                    } else {
+                        filename++; // Move past the last '/'
+                    }
+                    char newpath[1024];
+                    snprintf(newpath, sizeof(newpath), "%s/%s", isolated_dir, filename);
+                    printf("\t\t\t\t\t%s-%s\n", newpath, filepath);
+                    chmod(newpath, 0777);
+                    if (rename(filepath, newpath) != 0) {
+                        perror("rename");
+                        exit(EXIT_FAILURE);
+                    }
+                    chmod(newpath, 0000);
+                    printf("Fișierul %s a fost izolat în directorul %s\n", filepath, isolated_dir);
+                }
+                if (WEXITSTATUS(status) == 2) {
+                    (*isSafe) = 1;
+                }
+            } else {
+                printf("Procesul copil s-a încheiat anormal\n");
+            }
+        }
+        (*countFisCuPotential)++;
+    }
 }
 
 
 // Funcție pentru a parcurge directorul și a afișa informații despre fișiere și directoare
-void create_snapshot(EntryMetadata *metadata,int *countM,const char *path,const char *isolated_dir,int *countSusF) {
+void create_snapshot(EntryMetadata *metadata,int *countM,const char *path,const char *isolated_dir,int *countSusF,int *countFisCuPotential) {
     DIR *dir;
     struct dirent *entry;
     struct stat fileStat;
@@ -140,11 +218,11 @@ void create_snapshot(EntryMetadata *metadata,int *countM,const char *path,const 
         // Dacă este un director, parcurgem recursiv
         if (S_ISDIR(fileStat.st_mode)) {
             getEntryMetadata(filepath, &metadata[(*countM)++]);
-            create_snapshot(metadata,countM,filepath,isolated_dir,countSusF);
+            create_snapshot(metadata,countM,filepath,isolated_dir,countSusF,countFisCuPotential);
         }
 
         else{
-            checkPermissionsAndAnalyze(filepath,isolated_dir,&isSafe,&countUSF);///unsafe file
+            checkPermissionsAndAnalyze(filepath,isolated_dir,&isSafe,&countUSF,countFisCuPotential);///unsafe file
             if(isSafe==0){
                 (*countSusF)++;
                 continue;
@@ -193,7 +271,6 @@ void saveVectorMetaFis(EntryMetadata *metadata, const char *director_iesire, cha
 }
 
 
-
 int main(int argc, char *argv[]) {
     if (argc < 5 || argc >15) {
         printf("eroare nr argumente\n");
@@ -207,7 +284,8 @@ int main(int argc, char *argv[]) {
     EntryMetadata met[100];
     int nrProcese=argc-5;
     int pids[nrProcese];
-    int argBuneDir[nrProcese];
+    //int argBuneDir[nrProcese];
+    int countFisCuPotential=0;
 
     for(int i=5;i<argc;i++)
     {
@@ -226,9 +304,10 @@ int main(int argc, char *argv[]) {
         if (pid == 0) { 
             int countSusF=0;
             printf("Procesul copil cu PID-ul %d a inceput.->%s\n",getpid(),argv[i]);
-            create_snapshot(met,&countM,argv[i],isolated_dir,&countSusF);
+            create_snapshot(met,&countM,argv[i],isolated_dir,&countSusF,&countFisCuPotential);
+            printf("Numarul de fisiere cu potential periculos din directorul %s: %d\n",argv[i],countFisCuPotential);
             snprintf(filepath,sizeof(filepath),"%s/%d.txt",director_iesire,i-5);
-            printf("countM=%d in main\n",countM);
+            //printf("countM=%d in main\n",countM);
             printf("%s\n",filepath);
             saveVectorMetaFis(met,director_iesire,filepath,countM);
             printf("Snapshot creat cu succes.\n");
@@ -258,8 +337,8 @@ int main(int argc, char *argv[]) {
         i++;
         sleep(1);
     }
+    
 
     printf("\n");
-
-    return 0;
+    return 0;
 }
